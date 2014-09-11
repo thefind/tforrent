@@ -1,0 +1,579 @@
+#!/usr/bin/python
+#
+# $Id$
+#
+###############################################################################
+
+import sys
+import os
+import re
+import stat
+import time
+import select
+import signal
+
+
+def usage():
+  m = '''Usage: tforrent <srcpath> <dsthost> <dstpath>
+  -v           verbose
+  -n <num>     set parallel factor (8)
+  -bs <num>    set power-of-two block size (1048576)
+  -rt <num>    set retry count (2)
+  -x <glob>    exclude files matching glob
+  -m <addr>    mail on error
+  -log <path>  store messages in file (stdout)
+  -skip        skip files that match size and time
+
+It's recommended to use -log if using -m'''
+  print m
+
+###############################################################################
+
+class rec_t(object):
+  __slots__ = ('srcpath', 'dstpath', 'link', 'mode', 'size', 'mtime')
+
+class task_t(object):
+  __slots__ = ('srcpath', 'dstpath', 'seek', 'cnt', 'block', 'retries')
+
+
+class tforrent_t(object):
+
+  ways = 8
+  block = 1048576L
+  maxchunk = 1073741824L
+  retries = 2
+
+  ciphers = 'arcfour256,arcfour,aes128-cbc,aes128-ctr,aes256-cbc,blowfish-cbc'
+  sshbase = '-2x -oBatchMode=yes -oStrictHostKeyChecking=no -oClearAllForwardings=yes -oConnectTimeout=10 -oServerAliveInterval=10 -c ' + ciphers
+
+  xlate = {'*': '[^/]*', '?': '[^/]', '.': '\\.', '^': '\\^', '$': '\\$'}
+
+
+  def __init__(self):
+    self.verbose = 0
+    self.excludes = [re.compile(r'/COMPLETE$')]
+    self.srcpath = None
+    self.dstpath = None
+    self.dsthost = None
+    self.logpath = None
+    self.mail = []
+    self.ssh = None
+    self.sshm = None
+    self.cwd = os.getcwd()
+    self.debian = False
+    self.skip = False
+    try:
+      f = open('/etc/issue')
+      s = f.readline()
+      f.close()
+      if s.lower().find('debian') >= 0:
+        self.debian = True
+    except EnvironmentError:
+      pass
+
+
+  def addexclude(self, glob):
+    r = '/'
+    for c in glob:
+      x = self.xlate.get(c)
+      if x:
+        r += x
+      else:
+        r += c
+    r += '$'
+    rx = re.compile(r)
+    self.excludes.append(rx)
+
+
+  def run(self):
+    self.setup()
+
+    try:
+      self.dolog()
+      self.survey()
+      self.startmaster()
+      self.skipunchanged()
+      self.calctasks()
+      self.incomplete()
+      self.makedirs()
+      self.makelinks()
+      self.createfiles()
+      self.stopmaster()
+      self.runtasks()
+      self.startmaster()
+      self.settimes()
+      self.complete()
+      self.stopmaster()
+    except Exception, ex:
+      self.errs['ALL'] = str(ex)
+      self.cleanup(None, None)
+
+    self.summarize()
+
+    if self.errs:
+      return -1
+    return 0
+
+
+  def makedirs(self):
+    if self.verbose >= 1:
+      print 'making directories'
+    ssh = self.sshmaster()
+    for rec in self.dirs:
+      c1 = 'mkdir -p -m %o %s' % (rec.mode, rec.dstpath)
+      cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+      args = ['sh', '-c', cmd]
+      if self.verbose >= 2:
+        print c1
+      if os.spawnvp(os.P_WAIT, '/bin/sh', args) != 0:
+        raise RuntimeError, 'failed to ' + c1
+
+
+  def makelinks(self):
+    if self.verbose >= 1:
+      print 'creating symbolic links'
+    ssh = self.sshmaster()
+    for rec in self.links:
+      c1 = 'ln -sfn %s %s' % (rec.link, rec.dstpath)
+      cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+      args = ['sh', '-c', cmd]
+      if self.verbose >= 2:
+        print c1
+      if os.spawnvp(os.P_WAIT, '/bin/sh', args) != 0:
+        raise RuntimeError, 'failed to ' + c1
+
+
+  def createfiles(self):
+    if self.verbose >= 1:
+      print 'creating files'
+    ssh = self.sshmaster()
+    for rec in self.files:
+      c1 = 'install -m %o /dev/null %s' % (rec.mode, rec.dstpath)
+      cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+      args = ['sh', '-c', cmd]
+      if self.verbose >= 2:
+        print c1
+      if os.spawnvp(os.P_WAIT, '/bin/sh', args) != 0:
+        raise RuntimeError, 'failed to create ' + rec.dstpath
+
+
+  def settimes(self):
+    if self.verbose >= 1:
+      print 'updating file modification times'
+    ssh = self.sshmaster()
+    for rec in self.files:
+      c1 = 'touch -cmd @%d %s' % (rec.mtime, rec.dstpath)
+      cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+      args = ['sh', '-c', cmd]
+      if self.verbose >= 2:
+        print c1
+      if os.spawnvp(os.P_WAIT, '/bin/sh', args) != 0:
+        raise RuntimeError, 'failed to set mtime ' + rec.dstpath
+
+
+  def incomplete(self):
+    ssh = self.sshmaster()
+    c1 = 'rm -f %s/COMPLETE' % (self.dstpath)
+    cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+    args = ['sh', '-c', cmd]
+    if self.verbose >= 2:
+      print c1
+    os.spawnvp(os.P_WAIT, '/bin/sh', args)
+
+
+  def complete(self):
+    if self.errs:
+      return
+    ssh = self.sshmaster()
+    c1 = 'touch %s/COMPLETE' % (self.dstpath)
+    cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+    args = ['sh', '-c', cmd]
+    if self.verbose >= 2:
+      print c1
+    if os.spawnvp(os.P_WAIT, '/bin/sh', args) != 0:
+      raise RuntimeError, 'failed to ' + c1
+
+
+  def calctasks(self):
+    block = self.block
+    total = 0L
+    for rec in self.files:
+      total += rec.size
+    chunk = total / self.ways
+    chunk &= ~(block - 1)
+    if chunk > self.maxchunk:
+      chunk = self.maxchunk
+    if chunk < block:
+      chunk = block
+    self.total = total
+
+    if self.verbose >= 1:
+      print 'chunk size %d' % chunk
+
+    ary = []
+    for rec in self.files:
+      off = 0L
+      while off < rec.size:
+        task = task_t()
+        task.srcpath = rec.srcpath
+        task.dstpath = rec.dstpath
+        task.seek = off / block
+        task.cnt = chunk / block
+        task.block = block
+        task.retries = 0
+        ary.append(task)
+        off += chunk
+    self.tasks = ary
+
+
+  def runtasks(self):
+    signal.signal(signal.SIGCHLD, self.reap)
+
+    ssh = self.sshstr()
+    self.curtasks = self.tasks[:]
+    goal = len(self.tasks)
+    cnt = 0
+
+    while True:
+      procs = self.forks - self.reaps
+      if not self.curtasks and not procs:
+        break
+      nap = 0.1
+      if procs < self.ways:
+        if self.curtasks:
+          task = self.curtasks.pop(0)
+          if task.retries > 0:
+            time.sleep(1.0)
+            goal += 1  # white lie
+            if self.verbose >= 1:
+              print 'retrying %s %d' % (task.srcpath, task.seek)
+          c1 = ('dd if=%s bs=%d skip=%d count=%d' %
+                (task.srcpath, task.block, task.seek, task.cnt))
+          c2 = ('dd of=%s bs=%d seek=%d conv=notrunc' %
+                (task.dstpath, task.block, task.seek))
+          cmd = ('%s 2>/dev/null | %s %s "%s >&/dev/null"' %
+                 (c1, ssh, self.dsthost, c2))
+          #cmd = '%s | %s %s %s' % (c1, ssh, self.dsthost, c2)
+          if self.verbose >= 2:
+            print cmd
+          args = ['sh', '-c', cmd]
+          try:
+            pid = os.spawnvp(os.P_NOWAIT, '/bin/sh', args)
+            if self.pids.get(pid) is None:
+              self.pids[pid] = True
+              self.pid2task[pid] = task
+            else:
+              self.errs[task.srcpath] = True
+              del self.pids[pid]
+            self.forks += 1
+            cnt += 1
+            nap = 0.01
+          except OSError, se:
+            m = 'spawn error: ' + str(se)
+            self.errs[task.srcpath] = m
+            print m
+            nap = 0.1
+          if self.verbose >= 1:
+            print ('progress %d/%d, %d in flight' %
+                   (cnt, goal, self.forks - self.reaps))
+      time.sleep(nap)
+
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+
+  def survey(self):
+    if not self.dstpath.startswith('/'):
+      raise RuntimeError, 'dest path not absolute: ' + self.dstpath
+    if not self.srcpath.startswith('/'):
+      self.srcpath = self.cwd + '/' + self.srcpath
+    self.dirs = []
+    self.links = []
+    self.files = []
+    self.recurseone(self.srcpath, self.dstpath)
+
+
+  def recurseone(self, srcpath, dstpath):
+    for rx in self.excludes:
+      if rx.search(srcpath):
+        return
+
+    st = os.lstat(srcpath)
+    mode = st.st_mode
+    rec = rec_t()
+    if stat.S_ISLNK(mode):
+      rec.dstpath = dstpath
+      rec.link = os.readlink(srcpath)
+      self.links.append(rec)
+    elif stat.S_ISDIR(mode):
+      rec.dstpath = dstpath
+      rec.mode = mode & 0777
+      self.dirs.append(rec)
+      ents = os.listdir(srcpath)
+      ents.sort()
+      for ent in ents:
+        if (ent == '.') or (ent == '..'):
+          continue
+        sp = srcpath + '/' + ent
+        dp = dstpath + '/' + ent
+        self.recurseone(sp, dp)
+    elif stat.S_ISREG(mode):
+      rec.srcpath = srcpath
+      rec.dstpath = dstpath
+      rec.mode = mode & 0777
+      rec.size = st.st_size
+      rec.mtime = st.st_mtime
+      self.files.append(rec)
+
+
+  def skipunchanged(self):
+    if not self.skip:
+      return
+    if self.verbose >= 1:
+      print 'checking remote files'
+
+    ssh = self.sshmaster()
+    drops = []
+
+    sys.stdout.flush()
+    (pr, pw) = os.pipe()
+    sav1 = os.dup(1)  # save stdout
+    sav2 = os.dup(2)  # save stderr
+    os.dup2(pw, 1)    # pipe takes over stdout
+    os.dup2(pw, 2)    # pipe takes over stderr
+    fr = os.fdopen(pr)
+
+    try:
+      for rec in self.files:
+        c1 = 'ls -nog --time-style=+%s ' + rec.dstpath
+        cmd = '%s %s %s' % (ssh, self.dsthost, c1)
+        args = ['sh', '-c', cmd]
+        if self.verbose >= 2:
+          os.write(sav1, c1 + '\n')
+        res = os.spawnvp(os.P_WAIT, '/bin/sh', args)
+        (ni, no, ne) = select.select([pr], [], [], 0.1)
+        if ni:
+          lin = fr.readline()
+        else:
+          lin = ''
+        if (res == 0) and (lin.find('No such') < 0):
+          exp = lin.split()
+          size = long(exp[2])
+          mtime = long(exp[3])
+          if (size == rec.size) and (mtime == rec.mtime):
+            if self.verbose >= 1:
+              os.write(sav1, 'skipping unchanged' + rec.srcpath + '\n')
+            drops.append(rec)
+
+    finally:
+      os.dup2(sav1, 1)  # restore stdout
+      os.dup2(sav2, 2)  # restore stderr
+      fr.close()
+      os.close(pw)
+      os.close(sav1)
+      os.close(sav2)
+
+    for rec in drops:
+      self.files.remove(rec)
+
+
+  def setup(self):
+    self.t0 = time.time()
+    self.total = 0L
+    self.forks = 0
+    self.reaps = 0
+    self.pids = {}
+    self.pid2task = {}
+    self.errs = {}
+
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, self.cleanup)
+    signal.signal(signal.SIGQUIT, self.cleanup)
+    signal.signal(signal.SIGTERM, self.cleanup)
+
+
+  def dolog(self):
+    if self.logpath:
+      fd = os.open(self.logpath,
+                   os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND,
+                   0666)
+      os.dup2(fd, 1)  # stdout
+      os.dup2(fd, 2)  # stderr
+      os.close(fd)
+    if self.logpath or (self.verbose >= 1):
+      print 'START ' + time.ctime(self.t0)
+      sys.stdout.flush()
+
+
+  def summarize(self):
+    self.t1 = time.time()
+    if self.logpath or (self.verbose >= 1):
+      d = self.t1 - self.t0
+      s = self.total / 1048576.0 / d
+      print '%d bytes in %d sec = %f MB/s' % (self.total, d, s)
+      print 'END ' + time.ctime(self.t1)
+    errs = self.errs
+    if errs:
+      fns = errs.keys()
+      fns.sort()
+      for fn in fns:
+        x = errs[fn]
+        m = 'failed to copy ' + fn
+        if isinstance(x, str):
+          m += ': ' + x
+        print m
+
+      if self.mail:
+        host = os.uname()[1]
+        msg = '''host   = %s
+script = %s
+source = %s
+dest   = %s:%s
+
+Errors:
+''' % (host, sys.argv[0], self.srcpath, self.dsthost, self.dstpath)
+        if not self.logpath:
+          for fn in fns:
+            x = errs[fn]
+            m = 'failed to copy ' + fn
+            if isinstance(x, str):
+              m += ': ' + x + '\n'
+            msg += m
+        addrs = ' '.join(self.mail)
+        cmd = 'mailx -s "ERROR from tforrent on ' + host + '" ' + addrs
+        f = os.popen(cmd, 'w', 8192)
+        f.write(msg)
+        if self.logpath:
+          sys.stdout.flush()
+          os.close(1)  # stdout
+          os.close(2)  # stderr
+          g = open(self.logpath, 'r', 8192)
+          while True:
+            buf = g.read(8192)
+            if not buf:
+              break
+            f.write(buf)
+          g.close()
+        f.close()
+
+
+  def reap(self, signum, frame):
+    while True:
+      try:
+        kid, res = os.waitpid(-1, os.WNOHANG)
+      except:
+        kid = 0
+      if kid <= 0:
+        break
+      self.pids[kid] = res
+      self.reaps += 1
+      if res:
+        task = self.pid2task.get(kid)
+        if task:
+          task.retries += 1
+          if task.retries <= self.retries:
+            self.curtasks.append(task)
+          else:
+            self.errs[task.srcpath] = True
+
+
+  def cleanup(self, signum, frame):
+    for kid, val in self.pids.iteritems():
+      if val:
+        try:
+          os.kill(kid, signal.SIGTERM)
+        except OSError:
+          pass
+    if signum:
+      sys.exit(1)
+
+
+  def sshstr(self):
+    if not self.ssh:
+      # need to be compatible with ssh 4.3 options, no IPQoS, ControlPersist
+      ssh = 'ssh ' + self.sshbase
+      if self.debian:
+        ssh += ' -oSetupTimeOut=10'
+      self.ssh = ssh
+    return self.ssh
+
+
+  def sshmaster(self):
+    if not self.sshm:
+      ctl = '/tmp/%d-%d%%r%%p%%h' % (os.getpid(), os.getuid())
+      # need to be compatible with ssh 4.3 options, no IPQoS, ControlPersist
+      ssh = 'ssh -n -oControlPath=' + ctl + ' ' + self.sshbase
+      if self.debian:
+        ssh += ' -oSetupTimeOut=10'
+      self.sshm = ssh
+    return self.sshm
+
+
+  def startmaster(self):
+    # poor man's version of -oControlPersist=300
+    cmd = self.sshmaster() + ' -n -M ' + self.dsthost + ' sleep 300'
+    ary = cmd.split()
+    time.sleep(0.01)
+    os.spawnvp(os.P_NOWAIT, ary[0], ary)
+
+
+  def stopmaster(self):
+    cmd = self.sshmaster() + ' -n -O exit ' + self.dsthost + ' 2> /dev/null'
+    time.sleep(0.01)
+    os.system(cmd)
+
+###############################################################################
+
+def main(args = None):
+  if args is None:
+    args = sys.argv[1:]
+
+  tfo = tforrent_t()
+
+  try:
+    if not args:
+      raise RuntimeError
+    while args and args[0].startswith('-'):
+      arg = args.pop(0)
+      if arg == '-v':
+        tfo.verbose += 1
+      elif arg == '-n':
+        tfo.ways = int(args.pop(0))
+      elif arg == '-bs':
+        tfo.block = long(args.pop(0))
+      elif arg == '-rt':
+        tfo.retries = int(args.pop(0))
+      elif arg == '-x':
+        tfo.addexclude(args.pop(0))
+      elif arg == '-m':
+        tfo.mail.append(args.pop(0))
+      elif arg == '-log':
+        tfo.logpath = args.pop(0)
+      elif arg == '-skip':
+        tfo.skip = True
+      else:
+        raise RuntimeError, 'unknown option ' + arg
+
+    tfo.srcpath = args.pop(0)
+    tfo.dsthost = args.pop(0)
+    tfo.dstpath = args.pop(0)
+
+  except Exception, ex:
+    usage()
+    print ex
+    return 1
+
+  res = tfo.run()
+  if res < 0:
+    return 1
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())
+
+
+###############################################################################
+# Local Variables:
+# mode: indented-text
+# indent-tabs-mode: nil
+# End:
